@@ -2,158 +2,225 @@ package main
 
 import (
 	"context"
-	"github.com/VividCortex/ewma"
+	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strconv"
+	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/VividCortex/ewma"
+	"github.com/cheggaaa/pb/v3"
 )
 
-//bool connectionSucceed float32 time
-func tcping(ip net.IPAddr) (bool, float32) {
+// tcping 单次 TCP 连接测速,返回是否成功与延迟(ms)
+func tcping(addr netip.Addr, port int, timeout time.Duration) (bool, float32) {
 	startTime := time.Now()
-	conn, err := net.DialTimeout("tcp", ip.String()+":"+strconv.Itoa(defaultTcpPort), tcpConnectTimeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr.String(), fmt.Sprintf("%d", port)), timeout)
 	if err != nil {
 		return false, 0
-	} else {
-		var endTime = time.Since(startTime)
-		var duration = float32(endTime.Microseconds()) / 1000.0
-		_ = conn.Close()
-		return true, duration
 	}
+	defer func() { _ = conn.Close() }()
+	duration := float32(time.Since(startTime).Microseconds()) / 1000.0
+	return true, duration
 }
 
-//pingReceived pingTotalTime
-func checkConnection(ip net.IPAddr) (int, float32) {
-	pingRecv := 0
-	var pingTime float32 = 0.0
-	for i := 1; i <= failTime; i++ {
-		pingSucceed, pingTimeCurrent := tcping(ip)
-		if pingSucceed {
-			pingRecv++
-			pingTime += pingTimeCurrent
+// checkConnection 探测 failTime 次,带退避,返回成功延迟列表
+func checkConnection(addr netip.Addr, cfg Config) []float32 {
+	times := make([]float32, 0, cfg.FailTime)
+	for i := 0; i < cfg.FailTime; i++ {
+		ok, t := tcping(addr, cfg.TcpPort, cfg.TcpTimeout)
+		if ok {
+			times = append(times, t)
+		}
+		if i < cfg.FailTime-1 && cfg.BackoffDuration > 0 {
+			time.Sleep(cfg.BackoffDuration)
 		}
 	}
-	return pingRecv, pingTime
+	return times
 }
 
-//return Success packetRecv averagePingTime specificIPAddr
-func tcpingHandler(ip net.IPAddr, pingCount int, progressHandler func(e progressEvent)) (bool, int, float32, net.IPAddr) {
-	ipCanConnect := false
-	pingRecv := 0
-	var pingTime float32 = 0.0
-	for !ipCanConnect {
-		pingRecvCurrent, pingTimeCurrent := checkConnection(ip)
-		if pingRecvCurrent != 0 {
-			ipCanConnect = true
-			pingRecv = pingRecvCurrent
-			pingTime = pingTimeCurrent
-		} else {
-			ip.IP[15]++
-			if ip.IP[15] == 0 {
-				break
+// tcpingHandler 单 IP 完整测试
+// 修复原 bug:移除无效的 IP 末位递增分支,失败即放弃(采样已随机化)
+// 返回: success, pingReceived(成功次数), pingTimes(成功延迟列表)
+func tcpingHandler(addr netip.Addr, pingCount int, cfg Config, progressHandler func(e progressEvent)) (bool, int, []float32) {
+	probeTimes := checkConnection(addr, cfg)
+	if len(probeTimes) == 0 {
+		// 探测失败:补齐进度条到该 IP 应有次数,使总数对齐
+		progressHandler(NoAvailableIPFound)
+		return false, 0, nil
+	}
+	progressHandler(AvailableIPFound)
+	times := make([]float32, 0, pingCount)
+	times = append(times, probeTimes...)
+	// 补足剩余次数(pingCount - failTime)
+	for i := cfg.FailTime; i < pingCount; i++ {
+		ok, t := tcping(addr, cfg.TcpPort, cfg.TcpTimeout)
+		progressHandler(NormalPing)
+		if ok {
+			times = append(times, t)
+		}
+	}
+	return true, len(times), times
+}
+
+// handleProgressGenerator 创建进度回调
+func handleProgressGenerator(bar *pb.ProgressBar, pingTime, failTime int) func(e progressEvent) {
+	return func(e progressEvent) {
+		switch e {
+		case NoAvailableIPFound:
+			bar.Add(pingTime)
+		case AvailableIPFound:
+			bar.Add(failTime)
+		case NormalPing:
+			bar.Increment()
+		}
+	}
+}
+
+// runTcping 并发执行 TCPing
+func (s *Scanner) runTcping(ips []netip.Addr) []CloudflareIPData {
+	total := len(ips) * s.cfg.PingTime
+	bar := pb.StartNew(total)
+	defer bar.Finish()
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	data := make([]CloudflareIPData, 0)
+	control := make(chan struct{}, s.cfg.PingRoutine)
+
+	for _, ip := range ips {
+		wg.Add(1)
+		control <- struct{}{}
+		go func(ip netip.Addr) {
+			defer wg.Done()
+			defer func() { <-control }()
+			ph := handleProgressGenerator(bar, s.cfg.PingTime, s.cfg.FailTime)
+			ok, recv, times := tcpingHandler(ip, s.cfg.PingTime, s.cfg, ph)
+			if !ok {
+				return
+			}
+			d := CloudflareIPData{
+				IP:           ip,
+				PingCount:    s.cfg.PingTime,
+				PingReceived:  recv,
+				PingTimes:    times,
+			}
+			d.Finalize()
+			mu.Lock()
+			data = append(data, d)
+			mu.Unlock()
+		}(ip)
+	}
+	wg.Wait()
+	return data
+}
+
+// GetDialContextByAddr 返回绑定到指定 IP 的 DialContext,使 HTTP 请求经由该 Cloudflare 节点
+func GetDialContextByAddr(addr netip.Addr, port int) func(ctx context.Context, network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := &net.Dialer{Timeout: 5 * time.Second}
+		return d.DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), fmt.Sprintf("%d", port)))
+	}
+}
+
+// DownloadSpeedHandler 下载测速,返回是否成功与下载速度(B/s)
+// 修复:增加 HTTP 总超时、TLS ServerName,避免卡死与证书校验问题
+func DownloadSpeedHandler(addr netip.Addr, cfg Config) (bool, float32) {
+	transport := &http.Transport{
+		DialContext: GetDialContextByAddr(addr, 443),
+		TLSClientConfig: &tls.Config{
+			ServerName: "speed.cloudflare.com",
+		},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   cfg.DownloadTestTime + 5*time.Second, // 总超时保护
+	}
+	url := fmt.Sprintf("%s?bytes=%d", cfg.DownloadURL, cfg.DownloadSize)
+	response, err := client.Get(url)
+	if err != nil {
+		return false, 0
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return false, 0
+	}
+
+	timeStart := time.Now()
+	timeEnd := timeStart.Add(cfg.DownloadTestTime)
+	contentLength := response.ContentLength
+	buffer := make([]byte, 1024)
+	var contentRead int64
+	timeSlice := cfg.DownloadTestTime / 100
+	var lastContentRead int64
+	timeCounter := 1
+	nextTime := timeStart.Add(timeSlice)
+	e := ewma.NewMovingAverage()
+
+	for contentLength != contentRead {
+		currentTime := time.Now()
+		if currentTime.After(nextTime) {
+			timeCounter++
+			nextTime = timeStart.Add(timeSlice * time.Duration(timeCounter))
+			e.Add(float64(contentRead - lastContentRead))
+			lastContentRead = contentRead
+		}
+		if currentTime.After(timeEnd) {
+			break
+		}
+		n, err := response.Body.Read(buffer)
+		contentRead += int64(n)
+		if err != nil {
+			if err == io.EOF {
+				e.Add(float64(contentRead-lastContentRead) / (float64(nextTime.Sub(currentTime)) / float64(timeSlice)))
 			}
 			break
 		}
 	}
-	if ipCanConnect {
-		progressHandler(AvailableIPFound)
-		for i := failTime; i < pingCount; i++ {
-			pingSuccess, pingTimeCurrent := tcping(ip)
-			progressHandler(NormalPing)
-			if pingSuccess {
-				pingRecv++
-				pingTime += pingTimeCurrent
-			}
+	speed := float32(e.Value()) / (float32(cfg.DownloadTestTime.Seconds()) / 100)
+	return true, speed
+}
+
+// runDownloads 并行下载测速,失败时自动顺延下一个候选,直到收集够 count 个成功结果或耗尽列表
+func (s *Scanner) runDownloads(data []CloudflareIPData) []CloudflareIPData {
+	bar := pb.StartNew(s.cfg.DownloadTestCount)
+	defer bar.Finish()
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, s.cfg.DownloadRoutine)
+	out := make([]CloudflareIPData, 0, s.cfg.DownloadTestCount)
+
+	for i := 0; i < len(data); i++ {
+		mu.Lock()
+		done := len(out) >= s.cfg.DownloadTestCount
+		mu.Unlock()
+		if done {
+			break
 		}
-		return true, pingRecv, pingTime / float32(pingRecv), ip
-	} else {
-		progressHandler(NoAvailableIPFound)
-		return false, 0, 0, net.IPAddr{}
-	}
-}
-
-func tcpingGoroutine(wg *sync.WaitGroup, mutex *sync.Mutex, ip net.IPAddr, pingCount int, csv *[]CloudflareIPData, control chan bool, progressHandler func(e progressEvent)) {
-	defer wg.Done()
-	success, pingRecv, pingTimeAvg, currentIP := tcpingHandler(ip, pingCount, progressHandler)
-	if success {
-		mutex.Lock()
-		var cfdata CloudflareIPData
-		cfdata.ip = currentIP
-		cfdata.pingReceived = pingRecv
-		cfdata.pingTime = pingTimeAvg
-		cfdata.pingCount = pingCount
-		*csv = append(*csv, cfdata)
-		mutex.Unlock()
-	}
-	<-control
-}
-
-func GetDialContextByAddr(fakeSourceAddr string) func(ctx context.Context, network, address string) (net.Conn, error) {
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		c, e := (&net.Dialer{}).DialContext(ctx, network, fakeSourceAddr)
-		return c, e
-	}
-}
-
-//bool : can download,float32 downloadSpeed
-func DownloadSpeedHandler(ip net.IPAddr) (bool, float32) {
-	var client = http.Client{
-		Transport:     nil,
-		CheckRedirect: nil,
-		Jar:           nil,
-		Timeout:       0,
-	}
-	client.Transport = &http.Transport{
-		DialContext: GetDialContextByAddr(ip.String() + ":443"),
-	}
-	response, err := client.Get(url)
-
-	if err != nil {
-		return false, 0
-	} else {
-		defer func() { _ = response.Body.Close() }()
-		if response.StatusCode == 200 {
-			timeStart := time.Now()
-			timeEnd := timeStart.Add(downloadTestTime)
-
-			contentLength := response.ContentLength
-			buffer := make([]byte, downloadBufferSize)
-
-			var contentRead int64 = 0
-			var timeSlice = downloadTestTime / 100
-			var timeCounter = 1
-			var lastContentRead int64 = 0
-
-			var nextTime = timeStart.Add(timeSlice * time.Duration(timeCounter))
-			e := ewma.NewMovingAverage()
-
-			for ; contentLength != contentRead; {
-				var currentTime = time.Now()
-				if currentTime.After(nextTime) {
-					timeCounter += 1
-					nextTime = timeStart.Add(timeSlice * time.Duration(timeCounter))
-					e.Add(float64(contentRead - lastContentRead))
-					lastContentRead = contentRead
-				}
-				if currentTime.After(timeEnd) {
-					break
-				}
-				bufferRead, err := response.Body.Read(buffer)
-				contentRead += int64(bufferRead)
-				if err != nil {
-					if err != io.EOF {
-						break
-					} else {
-						e.Add(float64(contentRead-lastContentRead) / (float64(nextTime.Sub(currentTime)) / float64(timeSlice)))
-					}
-				}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ip := data[idx].IP
+			ok, speed := DownloadSpeedHandler(ip, s.cfg)
+			bar.Add(1)
+			if !ok || speed <= 0 {
+				return
 			}
-			return true, float32(e.Value()) / (float32(downloadTestTime.Seconds()) / 100)
-		} else {
-			return false, 0
-		}
+			mu.Lock()
+			if len(out) < s.cfg.DownloadTestCount {
+				d := data[idx]
+				d.DownloadSpeed = speed
+				out = append(out, d)
+			}
+			mu.Unlock()
+		}(i)
 	}
+	wg.Wait()
+	return out
 }
