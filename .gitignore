@@ -1,1 +1,11 @@
 dist
+# 构建产物
+CloudflareIPScanner
+CloudflareIPScanner.exe
+*.exe
+*.dll
+*.so
+*.dylib
+result
+result.csv
+result.json
